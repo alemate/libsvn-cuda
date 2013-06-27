@@ -1,25 +1,20 @@
-CXX ?= g++
-CFLAGS = -Wall -Wconversion -O3 -fPIC
-SHVER = 2
-OS = $(shell uname)
+all: svm-train-cuda svm-predict-cuda
 
-all: svm-train svm-predict svm-scale
+svm-train-cuda: rbfkernel.o svm.o svm-train.o
+	g++ -o svm-train-cuda  -L/usr/local/cuda-5.0/lib64 -lcudart -lcublas -fopenmp rbfkernel.o svm.o svm-train.o
 
-lib: svm.o
-	if [ "$(OS)" = "Darwin" ]; then \
-		SHARED_LIB_FLAG="-dynamiclib -Wl,-install_name,libsvm.so.$(SHVER)"; \
-	else \
-		SHARED_LIB_FLAG="-shared -Wl,-soname,libsvm.so.$(SHVER)"; \
-	fi; \
-	$(CXX) $${SHARED_LIB_FLAG} svm.o -o libsvm.so.$(SHVER)
+svm-predict-cuda: rbfkernel.o svm.o svm-predict.o
+	g++ -o svm-predict-cuda  -L/usr/local/cuda-5.0/lib64 -lcudart -lcublas -fopenmp rbfkernel.o svm.o svm-predict.o
 
-svm-predict: svm-predict.c svm.o
-	$(CXX) $(CFLAGS) svm-predict.c svm.o -o svm-predict -lm
-svm-train: svm-train.c svm.o
-	$(CXX) $(CFLAGS) svm-train.c svm.o -o svm-train -lm
-svm-scale: svm-scale.c
-	$(CXX) $(CFLAGS) svm-scale.c -o svm-scale
+rbfkernel.o: rbfkernel.cu
+	/usr/local/cuda-5.0/bin/nvcc -m64  -gencode arch=compute_10,code=sm_10 -gencode arch=compute_20,code=sm_20 -gencode arch=compute_30,code=sm_30 -gencode arch=compute_35,code=sm_35 -I/usr/local/cuda-5.0/include -I. -g -O3 -o rbfkernel.o -c rbfkernel.cu
+
 svm.o: svm.cpp svm.h
-	$(CXX) $(CFLAGS) -c svm.cpp
-clean:
-	rm -f *~ svm.o svm-train svm-predict svm-scale libsvm.so.$(SHVER)
+	g++  -std=c++0x  -m64 -c -o svm.o -g -g3 -ggdb -O3 -I/usr/local/cuda-5.0/include -I. -fopenmp svm.cpp
+
+svm-train.o: svm-train.cpp svm.h
+	g++  -std=c++0x  -m64 -c -o svm-train.o -g -g3 -ggdb -O3 -I/usr/local/cuda-5.0/include -I. -fopenmp svm-train.cpp
+
+svm-predict.o: svm-predict.cpp svm.h
+	g++  -std=c++0x  -m64 -c -o svm-predict.o -g -g3 -ggdb -O3 -I/usr/local/cuda-5.0/include -I. -fopenmp svm-predict.cpp
+

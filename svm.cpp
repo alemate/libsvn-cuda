@@ -1,3 +1,13 @@
+#define _CRT_SECURE_NO_WARNINGS 1
+#define _CRT_NONSTDC_DEPRECATE(a)
+
+#include <exception>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,9 +17,14 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <locale.h>
+
+#include <omp.h>
+
+bool debugdot = false;
+
 #include "svm.h"
 int libsvm_version = LIBSVM_VERSION;
-typedef float Qfloat;
+
 typedef signed char schar;
 #ifndef min
 template <class T> static inline T min(T x,T y) { return (x<y)?x:y; }
@@ -67,7 +82,7 @@ static void info(const char *fmt,...) {}
 class Cache
 {
 public:
-	Cache(int l,long int size);
+	Cache(int l, size_t size);
 	~Cache();
 
 	// request data [0,len)
@@ -77,7 +92,7 @@ public:
 	void swap_index(int i, int j);	
 private:
 	int l;
-	long int size;
+	size_t size;
 	struct head_t
 	{
 		head_t *prev, *next;	// a circular list
@@ -91,12 +106,12 @@ private:
 	void lru_insert(head_t *h);
 };
 
-Cache::Cache(int l_,long int size_):l(l_),size(size_)
+Cache::Cache(int l_,size_t size_):l(l_),size(size_)
 {
 	head = (head_t *)calloc(l,sizeof(head_t));	// initialized to 0
 	size /= sizeof(Qfloat);
 	size -= l * sizeof(head_t) / sizeof(Qfloat);
-	size = max(size, 2 * (long int) l);	// cache must be large enough for two columns
+	size = max(size, 2 * (size_t) l);	// cache must be large enough for two columns
 	lru_head.next = lru_head.prev = &lru_head;
 }
 
@@ -145,7 +160,7 @@ int Cache::get_data(const int index, Qfloat **data, int len)
 		// allocate new space
 		h->data = (Qfloat *)realloc(h->data,sizeof(Qfloat)*len);
 		size -= more;
-		swap(h->len,len);
+		std::swap(h->len,len);
 	}
 
 	lru_insert(h);
@@ -159,18 +174,18 @@ void Cache::swap_index(int i, int j)
 
 	if(head[i].len) lru_delete(&head[i]);
 	if(head[j].len) lru_delete(&head[j]);
-	swap(head[i].data,head[j].data);
-	swap(head[i].len,head[j].len);
+	std::swap(head[i].data,head[j].data);
+	std::swap(head[i].len,head[j].len);
 	if(head[i].len) lru_insert(&head[i]);
 	if(head[j].len) lru_insert(&head[j]);
 
-	if(i>j) swap(i,j);
+	if(i>j) std::swap(i,j);
 	for(head_t *h = lru_head.next; h!=&lru_head; h=h->next)
 	{
 		if(h->len > i)
 		{
 			if(h->len > j)
-				swap(h->data[i],h->data[j]);
+				std::swap(h->data[i],h->data[j]);
 			else
 			{
 				// give up
@@ -199,33 +214,43 @@ public:
 	virtual ~QMatrix() {}
 };
 
-class Kernel: public QMatrix {
+
+class KernelBase {
 public:
-	Kernel(int l, svm_node * const * x, const svm_parameter& param);
-	virtual ~Kernel();
+	KernelBase(int l, svm_node * const * x, const svm_parameter& param);
+	virtual ~KernelBase();
 
 	static double k_function(const svm_node *x, const svm_node *y,
-				 const svm_parameter& param);
-	virtual Qfloat *get_Q(int column, int len) const = 0;
-	virtual double *get_QD() const = 0;
-	virtual void swap_index(int i, int j) const	// no so const...
-	{
-		swap(x[i],x[j]);
-		if(x_square) swap(x_square[i],x_square[j]);
-	}
+				 const svm_parameter& param, const bool debug);
 protected:
 
-	double (Kernel::*kernel_function)(int i, int j) const;
+	double (KernelBase::*kernel_function)(int i, int j) const;
+	void (KernelBase::*kernel_function_vector)(int i, int start, int len, Qfloat* out) const;
 
-private:
 	const svm_node **x;
 	double *x_square;
+	const int rows;
+	int cols;
 
 	// svm_parameter
 	const int kernel_type;
 	const int degree;
 	const double gamma;
 	const double coef0;
+
+public:
+	typedef std::vector<double> Host_x_squares; // not "x_square" because double != float
+	std::vector<double> host_csr_matrix; // (nnz);
+	std::vector<int>   host_csr_RowPtrA;   // rows + 1
+	std::vector<int>   host_csr_ColIndA; // (nnz);
+	Host_x_squares host_x_squares;
+	mutable std::vector<int>   host_csr_matrix_index_permutation; // (rows)
+	mutable bool host_permutation_updated; // is true when host permutation should be uploaded to device
+
+	int    csr_matrix_nnz; // number of non-zero entries in X sparse matrix
+
+	std::shared_ptr<CUDAKernelData> cukerneldata;
+	std::shared_ptr<CUDAKernelLearn> cukernel;
 
 	static double dot(const svm_node *px, const svm_node *py);
 	double kernel_linear(int i, int j) const
@@ -248,73 +273,235 @@ private:
 	{
 		return x[i][(int)(x[j][0].value)].value;
 	}
+
+	void kernel_rbf_vector(const int i, const int start, const int len, Qfloat* const out) const {
+		if (host_permutation_updated) {
+			std::cout << "host_permutation_updated" << std::endl;
+			cukerneldata->update_device_permutation(&host_csr_matrix_index_permutation[0]);
+			host_permutation_updated = false;
+		}
+
+		cukernel->kernel_function_vector_rbf(gamma, i, start, len, out);
+
+		const int outlen = len - start;
+		//std::cout << "out: [ ";
+		//for(size_t jj = 0; jj < rows; ++jj) {
+		//	std::cout << out[jj] << " ";
+		//}
+		//std::cout << "]" << std::endl;
+
+		// Check: out[j] == dot(x[i], x[j]);
+		if (false /* start !=0 || len != rows */) {
+			/*std::cout << "kernel_rbf_vector(): cudaMemcpy(out, y_device, sizeof(*out)="
+				<< sizeof(*out) << " * outlen=" << outlen << " = " << (size_t)(sizeof(*out) * outlen)
+				<< ") success.\n";
+		
+
+				*/
+			size_t failed = 0;
+			for(int j = start; j < len; ++j) {
+				const float d = (Qfloat)exp(-gamma*(x_square[i]+x_square[j]-2*dot(x[i], x[j])));
+				if (fabs(out[j] - d) > 1e-3) {
+					debugdot=true;
+					dot(x[i], x[j]); // print debug
+					debugdot = false;
+					std::cerr << "kernel_rbf_vector(i=" << i << "): out[j=" << j << "]=" << out[j] << " != dot(x[i], x[j])=" << d << "\n";
+					++failed;
+				}
+				if (failed > 10) {
+					break;
+				}
+			}
+			if (failed) {
+				std::cout <<  "Failed: Test: start=" << start
+					<< " len=" << len
+					<<" outlen=" << outlen
+					<< " rows=" << rows
+					<< " cols=" << cols
+					<< " host_csr_RowPtrA[len=" << len << "=" << len << "]=" << host_csr_RowPtrA[len]
+					<< " csr_matrix_nnz=" << csr_matrix_nnz
+					<< std::endl;
+				exit(1);
+			}
+		}
+		/*int j;
+		#pragma omp parallel for private(j)
+		for(j = start; j < len; ++j) {
+			out[j] = (Qfloat)exp(-gamma*(x_square[i]+x_square[j]-2*out[j]));
+		}*/
+//		std::cout << "kernel_rbf_vector(i=" << i << ", len=" << len << ") finished (rows=" << rows << ")\n";
+
+	}
 };
 
-Kernel::Kernel(int l, svm_node * const * x_, const svm_parameter& param)
-:kernel_type(param.kernel_type), degree(param.degree),
- gamma(param.gamma), coef0(param.coef0)
+struct Kernel : public KernelBase, public QMatrix {
+	virtual Qfloat *get_Q(int column, int len) const = 0;
+	virtual double *get_QD() const = 0;
+
+	Kernel(int l, svm_node * const * x, const svm_parameter& param) : KernelBase(l, x, param) {}
+	virtual void swap_index(int i, int j) const	// no so const...
+	{
+		if  (i < 0 || j < 0 || i >=host_csr_matrix_index_permutation.size() || j >= host_csr_matrix_index_permutation.size()) {
+			std::cout << "swap(" << i <<", " << j << ")" << std::endl;
+		}
+		std::swap(x[i],x[j]);
+		std::swap(host_csr_matrix_index_permutation[i], host_csr_matrix_index_permutation[j]);
+		host_permutation_updated = true;
+
+		if(x_square)
+			std::swap(x_square[i],x_square[j]);
+
+	}
+};
+
+KernelBase::KernelBase(int l, svm_node * const * x_, const svm_parameter& param)
+: kernel_function(NULL),
+ kernel_function_vector(NULL),
+ rows(l),
+ cols(0),
+ kernel_type(param.kernel_type), degree(param.degree),
+ gamma(param.gamma), coef0(param.coef0),
+ host_permutation_updated(false),
+ csr_matrix_nnz(0)
 {
 	switch(kernel_type)
 	{
 		case LINEAR:
 			kernel_function = &Kernel::kernel_linear;
+			throw KernelException("LINEAR kernel is not supported with CUDA");
 			break;
 		case POLY:
 			kernel_function = &Kernel::kernel_poly;
+			throw KernelException("POLY kernel is not supported with CUDA");
 			break;
 		case RBF:
 			kernel_function = &Kernel::kernel_rbf;
+			kernel_function_vector = &Kernel::kernel_rbf_vector;
 			break;
 		case SIGMOID:
 			kernel_function = &Kernel::kernel_sigmoid;
+			throw KernelException("SIGMOID kernel is not supported with CUDA");
 			break;
 		case PRECOMPUTED:
 			kernel_function = &Kernel::kernel_precomputed;
+			throw KernelException("PRECOMPUTED kernel is not supported with CUDA");
 			break;
 	}
 
 	clone(x,x_,l);
 
+	int nnz = 0; // total number of non-zero entries;
 	if(kernel_type == RBF)
 	{
 		x_square = new double[l];
-		for(int i=0;i<l;i++)
+		for(int i=0;i<l;i++) {
 			x_square[i] = dot(x[i],x[i]);
+			const svm_node * pos = x[i];
+			while(pos->index != -1) {
+				++nnz;
+				cols=max(cols, pos->index);
+				++pos;
+			}
+		}
 	}
 	else
 		x_square = 0;
+
+	{
+		// Create matrix in Compressed Sparse Row Format format and copy it to device
+		csr_matrix_nnz = nnz;
+
+		host_csr_matrix.resize(nnz);
+		host_csr_RowPtrA.resize(l+1);
+		host_csr_ColIndA.resize(nnz);
+		host_csr_matrix_index_permutation.resize(l);
+		memset(&host_csr_matrix[0], 0, sizeof(host_csr_matrix[0]) * host_csr_matrix.size());
+		memset(&host_csr_RowPtrA[0], 0, sizeof(host_csr_RowPtrA[0]) * host_csr_RowPtrA.size());
+		memset(&host_csr_ColIndA[0], 0, sizeof(host_csr_ColIndA[0]) * host_csr_ColIndA.size());
+		for(int i=0; i < host_csr_matrix_index_permutation.size(); ++i) {
+			host_csr_matrix_index_permutation[i] = i;
+		}
+
+		int matrixpos = 0;
+
+		for(int i=0; i<l; i++) {
+			host_csr_RowPtrA[i] = matrixpos;
+			const svm_node * pos = x[i];
+			while(pos->index != -1) {
+				host_csr_matrix[matrixpos] = pos->value;
+				host_csr_ColIndA[matrixpos] = pos->index - 1; // host_CSR_matrix is zero-based
+				++pos;
+				++matrixpos;
+			}
+		}
+		host_csr_RowPtrA[l] = host_csr_RowPtrA[0] + csr_matrix_nnz;
+
+		/*
+		std::cout << " Kernel: rows = " << rows << "\n"; 
+		for(int rcheck = 250; rcheck < rows - 1; ++rcheck) {
+			std::cout << "Matrix row " << rcheck << ": [ ";
+			for(int pos = host_csr_RowPtrA[rcheck]; pos < host_csr_RowPtrA[rcheck + 1]; ++pos) {
+				std::cout << host_csr_ColIndA[pos] << ":" << host_csr_matrix[pos] << " ";
+			}
+			std::cout << "]\n";
+		}
+		*/
+
+		host_x_squares.resize(rows);
+		for(size_t i = 0; i < rows; ++i) {
+			host_x_squares[i] = Host_x_squares::value_type(x_square[i]);
+		}
+		cukerneldata.reset(new CUDAKernelData(
+			rows
+			, cols
+			, host_x_squares
+			, host_csr_matrix
+			, host_csr_RowPtrA
+			, host_csr_ColIndA
+			, host_csr_matrix_index_permutation
+			)
+		);
+
+		cukernel.reset(new CUDAKernelLearn(cukerneldata.get()));
+	}
 }
 
-Kernel::~Kernel()
+KernelBase::~KernelBase()
 {
 	delete[] x;
 	delete[] x_square;
 }
 
-double Kernel::dot(const svm_node *px, const svm_node *py)
+double KernelBase::dot(const svm_node *px, const svm_node *py)
 {
 	double sum = 0;
+	if (debugdot) { std::cout << "dot(): " ; }
 	while(px->index != -1 && py->index != -1)
 	{
 		if(px->index == py->index)
 		{
+			if (debugdot) { std::cout << px->index << ":" << px->value << "*"<< py->value << " "; }
 			sum += px->value * py->value;
 			++px;
 			++py;
 		}
 		else
 		{
-			if(px->index > py->index)
+			if(px->index > py->index) {
+				if (debugdot) { std::cout << py->index << ":_*"<< py->value << " ";}
 				++py;
-			else
+			} else {
+				if (debugdot) { std::cout << px->index << ":"<< py->value << "*_ "; }
 				++px;
+			}
 		}			
 	}
+	if (debugdot) { std::cout << std::endl; }
 	return sum;
 }
 
-double Kernel::k_function(const svm_node *x, const svm_node *y,
-			  const svm_parameter& param)
+double KernelBase::k_function(const svm_node *x, const svm_node *y,
+			  const svm_parameter& param, const bool/* debug*/)
 {
 	switch(param.kernel_type)
 	{
@@ -325,42 +512,73 @@ double Kernel::k_function(const svm_node *x, const svm_node *y,
 		case RBF:
 		{
 			double sum = 0;
+			//size_t x_len = 0;
+			//size_t y_len = 0;
+
 			while(x->index != -1 && y->index !=-1)
 			{
 				if(x->index == y->index)
 				{
-					double d = x->value - y->value;
+					const double d = x->value - y->value;
+					//if (debug) {
+					//	printf("(x[%d]=%f - y[%d]=%f)**2=%f**2 ", x->index, x->value, y->index, y->value, d);
+					//}
 					sum += d*d;
 					++x;
 					++y;
+
+					//++x_len;
+					//++y_len;
 				}
 				else
 				{
 					if(x->index > y->index)
-					{	
+					{
+						//if (debug) {
+						//	printf("y[%d]**2=%f**2 ", y->index, y->value, y->value * y->value);
+						//}
 						sum += y->value * y->value;
 						++y;
+
+						//++y_len;
 					}
 					else
 					{
+						//if (debug) {
+						//	printf("x[%d]**2=%f**2 ", x->index, x->value, x->value * x->value);
+						//}
 						sum += x->value * x->value;
 						++x;
+
+						//++x_len;
 					}
 				}
 			}
 
 			while(x->index != -1)
 			{
+				//if (debug) {
+				//	printf("x[%d]**2=%f**2 ", x->index, x->value, x->value * x->value);
+				//}
 				sum += x->value * x->value;
 				++x;
+
+				//++x_len;
 			}
 
 			while(y->index != -1)
 			{
+				//if (debug) {
+				//	printf("y[%d]**2=%f**2 ", y->index, y->value, y->value * y->value);
+				//}
 				sum += y->value * y->value;
 				++y;
+
+				//++y_len;
 			}
-			
+			//if (debug) {
+			//	printf("\n(x_len=%lu y_len=%lu)\n\n", x_len, y_len);
+			//}
 			return exp(-param.gamma*sum);
 		}
 		case SIGMOID:
@@ -435,28 +653,28 @@ protected:
 			alpha_status[i] = LOWER_BOUND;
 		else alpha_status[i] = FREE;
 	}
-	bool is_upper_bound(int i) { return alpha_status[i] == UPPER_BOUND; }
-	bool is_lower_bound(int i) { return alpha_status[i] == LOWER_BOUND; }
-	bool is_free(int i) { return alpha_status[i] == FREE; }
+	bool is_upper_bound(const int i) const { return alpha_status[i] == UPPER_BOUND; }
+	bool is_lower_bound(const int i) const { return alpha_status[i] == LOWER_BOUND; }
+	bool is_free(const int i) const { return alpha_status[i] == FREE; }
 	void swap_index(int i, int j);
 	void reconstruct_gradient();
 	virtual int select_working_set(int &i, int &j);
 	virtual double calculate_rho();
 	virtual void do_shrinking();
 private:
-	bool be_shrunk(int i, double Gmax1, double Gmax2);	
+	bool be_shrunk(int i, double Gmax1, double Gmax2) const;	
 };
 
 void Solver::swap_index(int i, int j)
 {
 	Q->swap_index(i,j);
-	swap(y[i],y[j]);
-	swap(G[i],G[j]);
-	swap(alpha_status[i],alpha_status[j]);
-	swap(alpha[i],alpha[j]);
-	swap(p[i],p[j]);
-	swap(active_set[i],active_set[j]);
-	swap(G_bar[i],G_bar[j]);
+	std::swap(y[i],y[j]);
+	std::swap(G[i],G[j]);
+	std::swap(alpha_status[i],alpha_status[j]);
+	std::swap(alpha[i],alpha[j]);
+	std::swap(p[i],p[j]);
+	std::swap(active_set[i],active_set[j]);
+	std::swap(G_bar[i],G_bar[j]);
 }
 
 void Solver::reconstruct_gradient()
@@ -519,6 +737,7 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 	// initialize alpha_status
 	{
 		alpha_status = new char[l];
+		#pragma omp parallel for
 		for(int i=0;i<l;i++)
 			update_alpha_status(i);
 	}
@@ -535,30 +754,37 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 	{
 		G = new double[l];
 		G_bar = new double[l];
-		int i;
-		for(i=0;i<l;i++)
-		{
-			G[i] = p[i];
-			G_bar[i] = 0;
-		}
-		for(i=0;i<l;i++)
+		//int i;
+		//for(i=0;i<l;i++)
+		//{
+		//	G[i] = p[i];
+		//	G_bar[i] = 0;
+		//}
+		memcpy(G, p, sizeof(*G) * l);
+		memset(G_bar, 0, sizeof(*G_bar) * l);
+
+		for(int i=0;i<l;i++)
 			if(!is_lower_bound(i))
 			{
 				const Qfloat *Q_i = Q.get_Q(i,l);
-				double alpha_i = alpha[i];
-				int j;
-				for(j=0;j<l;j++)
+				const double alpha_i = alpha[i];
+
+				#pragma omp parallel for
+				for(int j=0; j<l; ++j)
 					G[j] += alpha_i*Q_i[j];
-				if(is_upper_bound(i))
-					for(j=0;j<l;j++)
+
+				if(is_upper_bound(i)) {
+					#pragma omp parallel for
+					for(int j=0; j<l; ++j)
 						G_bar[j] += get_C(i) * Q_i[j];
+				}
 			}
 	}
 
 	// optimization step
 
 	int iter = 0;
-	int max_iter = max(10000000, l>INT_MAX/100 ? INT_MAX : 100*l);
+	const int max_iter = max(10000000, l>INT_MAX/100 ? INT_MAX : 100*l);
 	int counter = min(l,1000)+1;
 	
 	while(iter < max_iter)
@@ -593,13 +819,13 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 		const Qfloat *Q_i = Q.get_Q(i,active_size);
 		const Qfloat *Q_j = Q.get_Q(j,active_size);
 
-		double C_i = get_C(i);
-		double C_j = get_C(j);
+		const double C_i = get_C(i);
+		const double C_j = get_C(j);
 
-		double old_alpha_i = alpha[i];
-		double old_alpha_j = alpha[j];
+		const double old_alpha_i = alpha[i];
+		const double old_alpha_j = alpha[j];
 
-		if(y[i]!=y[j])
+		if(y[i] != y[j])
 		{
 			double quad_coef = QD[i]+QD[j]+2*Q_i[j];
 			if (quad_coef <= 0)
@@ -688,10 +914,11 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 
 		// update G
 
-		double delta_alpha_i = alpha[i] - old_alpha_i;
-		double delta_alpha_j = alpha[j] - old_alpha_j;
+		const double delta_alpha_i = alpha[i] - old_alpha_i;
+		const double delta_alpha_j = alpha[j] - old_alpha_j;
 		
-		for(int k=0;k<active_size;k++)
+		#pragma omp parallel for
+		for(int k=0; k < active_size; k++)
 		{
 			G[k] += Q_i[k]*delta_alpha_i + Q_j[k]*delta_alpha_j;
 		}
@@ -699,31 +926,37 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 		// update alpha_status and G_bar
 
 		{
-			bool ui = is_upper_bound(i);
-			bool uj = is_upper_bound(j);
+			const bool ui = is_upper_bound(i);
+			const bool uj = is_upper_bound(j);
 			update_alpha_status(i);
 			update_alpha_status(j);
-			int k;
+
 			if(ui != is_upper_bound(i))
 			{
 				Q_i = Q.get_Q(i,l);
-				if(ui)
-					for(k=0;k<l;k++)
+				if(ui) {
+					#pragma omp parallel for
+					for(int k=0;k<l;k++)
 						G_bar[k] -= C_i * Q_i[k];
-				else
-					for(k=0;k<l;k++)
+				} else {
+					#pragma omp parallel for
+					for(int k=0;k<l;k++)
 						G_bar[k] += C_i * Q_i[k];
+				}
 			}
 
 			if(uj != is_upper_bound(j))
 			{
 				Q_j = Q.get_Q(j,l);
-				if(uj)
-					for(k=0;k<l;k++)
+				if(uj) {
+					#pragma omp parallel for
+					for(int k=0; k<l; k++)
 						G_bar[k] -= C_j * Q_j[k];
-				else
-					for(k=0;k<l;k++)
+				} else {
+					#pragma omp parallel for
+					for(int k=0; k<l; k++)
 						G_bar[k] += C_j * Q_j[k];
+				}
 			}
 		}
 	}
@@ -748,6 +981,8 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 	{
 		double v = 0;
 		int i;
+
+		#pragma omp parallel for private(i) reduction(+:v)
 		for(i=0;i<l;i++)
 			v += alpha[i] * (G[i] + p[i]);
 
@@ -797,7 +1032,7 @@ int Solver::select_working_set(int &out_i, int &out_j)
 	int Gmin_idx = -1;
 	double obj_diff_min = INF;
 
-	for(int t=0;t<active_size;t++)
+	for(int t=0;t<active_size;t++) {
 		if(y[t]==+1)	
 		{
 			if(!is_upper_bound(t))
@@ -816,6 +1051,7 @@ int Solver::select_working_set(int &out_i, int &out_j)
 					Gmax_idx = t;
 				}
 		}
+	}
 
 	int i = Gmax_idx;
 	const Qfloat *Q_i = NULL;
@@ -828,13 +1064,13 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		{
 			if (!is_lower_bound(j))
 			{
-				double grad_diff=Gmax+G[j];
+				const double grad_diff=Gmax+G[j];
 				if (G[j] >= Gmax2)
 					Gmax2 = G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff; 
-					double quad_coef = QD[i]+QD[j]-2.0*y[i]*Q_i[j];
+					const double quad_coef = QD[i]+QD[j]-2.0*y[i]*Q_i[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -852,13 +1088,13 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		{
 			if (!is_upper_bound(j))
 			{
-				double grad_diff= Gmax-G[j];
+				const double grad_diff= Gmax-G[j];
 				if (-G[j] >= Gmax2)
 					Gmax2 = -G[j];
 				if (grad_diff > 0)
 				{
 					double obj_diff; 
-					double quad_coef = QD[i]+QD[j]+2.0*y[i]*Q_i[j];
+					const double quad_coef = QD[i]+QD[j]+2.0*y[i]*Q_i[j];
 					if (quad_coef > 0)
 						obj_diff = -(grad_diff*grad_diff)/quad_coef;
 					else
@@ -882,7 +1118,7 @@ int Solver::select_working_set(int &out_i, int &out_j)
 	return 0;
 }
 
-bool Solver::be_shrunk(int i, double Gmax1, double Gmax2)
+bool Solver::be_shrunk(int i, double Gmax1, double Gmax2) const 
 {
 	if(is_upper_bound(i))
 	{
@@ -1270,8 +1506,10 @@ public:
 	:Kernel(prob.l, prob.x, param)
 	{
 		clone(y,y_,prob.l);
-		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
+		cache = new Cache(prob.l,size_t(param.cache_size*(1<<20)));
 		QD = new double[prob.l];
+
+		//#pragma omp parallel for
 		for(int i=0;i<prob.l;i++)
 			QD[i] = (this->*kernel_function)(i,i);
 	}
@@ -1279,11 +1517,26 @@ public:
 	Qfloat *get_Q(int i, int len) const
 	{
 		Qfloat *data;
-		int start, j;
-		if((start = cache->get_data(i,&data,len)) < len)
+		const int start = cache->get_data(i,&data,len);
+		if(start < len)
 		{
+			/*if (start != 0) {
+				std::cerr << "SVC_Q::get_Q(i=" << i << ", len=" << len << "): start=" << start << " != 0!" << std::endl;
+				abort();
+
+
+			}*/
+			/*
 			for(j=start;j<len;j++)
 				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
+
+			*/
+			(this->*kernel_function_vector)(i, start, len, data);
+
+			//#pragma omp parallel for
+			for(int j=start;j<len;j++)
+				data[j] = (Qfloat)(y[i]*y[j]*data[j]);
+
 		}
 		return data;
 	}
@@ -1297,8 +1550,8 @@ public:
 	{
 		cache->swap_index(i,j);
 		Kernel::swap_index(i,j);
-		swap(y[i],y[j]);
-		swap(QD[i],QD[j]);
+		std::swap(y[i],y[j]);
+		std::swap(QD[i],QD[j]);
 	}
 
 	~SVC_Q()
@@ -1319,7 +1572,7 @@ public:
 	ONE_CLASS_Q(const svm_problem& prob, const svm_parameter& param)
 	:Kernel(prob.l, prob.x, param)
 	{
-		cache = new Cache(prob.l,(long int)(param.cache_size*(1<<20)));
+		cache = new Cache(prob.l,size_t(param.cache_size*(1<<20)));
 		QD = new double[prob.l];
 		for(int i=0;i<prob.l;i++)
 			QD[i] = (this->*kernel_function)(i,i);
@@ -1328,11 +1581,14 @@ public:
 	Qfloat *get_Q(int i, int len) const
 	{
 		Qfloat *data;
-		int start, j;
+		int start;
 		if((start = cache->get_data(i,&data,len)) < len)
 		{
-			for(j=start;j<len;j++)
+			/*
+			for(int j=start;j<len;j++)
 				data[j] = (Qfloat)(this->*kernel_function)(i,j);
+			*/
+			(this->*kernel_function_vector)(i, start, len, data);
 		}
 		return data;
 	}
@@ -1366,7 +1622,7 @@ public:
 	:Kernel(prob.l, prob.x, param)
 	{
 		l = prob.l;
-		cache = new Cache(l,(long int)(param.cache_size*(1<<20)));
+		cache = new Cache(l,size_t(param.cache_size*(1<<20)));
 		QD = new double[2*l];
 		sign = new schar[2*l];
 		index = new int[2*l];
@@ -1386,9 +1642,9 @@ public:
 
 	void swap_index(int i, int j) const
 	{
-		swap(sign[i],sign[j]);
-		swap(index[i],index[j]);
-		swap(QD[i],QD[j]);
+		std::swap(sign[i],sign[j]);
+		std::swap(index[i],index[j]);
+		std::swap(QD[i],QD[j]);
 	}
 	
 	Qfloat *get_Q(int i, int len) const
@@ -1959,9 +2215,12 @@ static void svm_binary_svc_probability(
 			subparam.weight[0]=Cp;
 			subparam.weight[1]=Cn;
 			struct svm_model *submodel = svm_train(&subprob,&subparam);
+
+			CUDAKernelPredict kernel(submodel->cuda_kernel_data.get(), submodel->sv_coef[0], SVM_Type(submodel->param.svm_type));
+
 			for(j=begin;j<end;j++)
 			{
-				svm_predict_values(submodel,prob->x[perm[j]],&(dec_values[perm[j]])); 
+				svm_predict_values(submodel, kernel, prob->x[perm[j]],&(dec_values[perm[j]])); 
 				// ensure +1 -1 order; reason not using CV subroutine
 				dec_values[perm[j]] *= submodel->label[0];
 			}		
@@ -2073,7 +2332,7 @@ static void svm_group_classes(const svm_problem *prob, int *nr_class_ret, int **
 //
 svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 {
-	svm_model *model = Malloc(svm_model,1);
+	svm_model *model = new svm_model;
 	model->param = *param;
 	model->free_sv = 0;	// XXX
 
@@ -2314,6 +2573,11 @@ svm_model *svm_train(const svm_problem *prob, const svm_parameter *param)
 		free(nz_count);
 		free(nz_start);
 	}
+
+	KernelBase kernel(model->l, model->SV, model->param);
+
+	model->cuda_kernel_data = kernel.cukerneldata;
+
 	return model;
 }
 
@@ -2326,6 +2590,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 	int *perm = Malloc(int,l);
 	int nr_class;
 
+	std::cerr << "svm_type = " << param->svm_type << std::endl;
 	// stratified cv may not give leave-one-out rate
 	// Each class to l folds -> some folds may have zero elements
 	if((param->svm_type == C_SVC ||
@@ -2383,7 +2648,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 		for(i=0;i<l;i++)
 		{
 			int j = i+rand()%(l-i);
-			swap(perm[i],perm[j]);
+			std::swap(perm[i],perm[j]);
 		}
 		for(i=0;i<=nr_fold;i++)
 			fold_start[i]=i*l/nr_fold;
@@ -2414,17 +2679,49 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 			++k;
 		}
 		struct svm_model *submodel = svm_train(&subprob,param);
+
+		const int numparallel = omp_get_max_threads();
+
+		std::vector<std::unique_ptr<CUDAKernelPredict> > cuda_kernels;
+		for(int i = 0; i < numparallel; ++i) {
+			cuda_kernels.push_back(
+				std::unique_ptr<CUDAKernelPredict>(
+				new CUDAKernelPredict(submodel->cuda_kernel_data.get(), submodel->sv_coef[0], SVM_Type(submodel->param.svm_type))
+				)
+				);
+		}
+
 		if(param->probability && 
 		   (param->svm_type == C_SVC || param->svm_type == NU_SVC))
 		{
 			double *prob_estimates=Malloc(double,svm_get_nr_class(submodel));
-			for(j=begin;j<end;j++)
-				target[perm[j]] = svm_predict_probability(submodel,prob->x[perm[j]],prob_estimates);
+
+			#pragma omp parallel for
+			for(j=begin;j<end;j++) {
+				const int threadnum = omp_get_thread_num() % cuda_kernels.size();
+
+				std::lock_guard<std::mutex> g(cuda_kernels[threadnum]->m);
+
+				target[perm[j]] = svm_predict_probability(submodel, *cuda_kernels[threadnum], prob->x[perm[j]], prob_estimates);
+			}
 			free(prob_estimates);			
 		}
-		else
-			for(j=begin;j<end;j++)
-				target[perm[j]] = svm_predict(submodel,prob->x[perm[j]]);
+		else {
+			#pragma omp parallel for
+			for(j=begin;j<end;j++) {
+				const int threadnum = omp_get_thread_num() % cuda_kernels.size();
+
+				std::lock_guard<std::mutex> g(cuda_kernels[threadnum]->m);
+
+				target[perm[j]] = svm_predict(submodel, *cuda_kernels[threadnum], prob->x[perm[j]]);
+
+				++(cuda_kernels[threadnum]->numused);
+			}
+	
+			//for(size_t i = 0; i < cuda_kernels.size(); ++i) {
+			//	std::cerr << "cuda_kernels[" << i << " / " << cuda_kernels.size() << "] used: " << cuda_kernels[i]->numused << std::endl;
+			//}
+		}
 		svm_free_and_destroy_model(&submodel);
 		free(subprob.x);
 		free(subprob.y);
@@ -2475,19 +2772,43 @@ double svm_get_svr_probability(const svm_model *model)
 	}
 }
 
-double svm_predict_values(const svm_model *model, const svm_node *x, double* dec_values)
+double svm_predict_values(const svm_model *model, CUDAKernelPredict& kernel, const svm_node *x, double* dec_values)
 {
 	int i;
 	if(model->param.svm_type == ONE_CLASS ||
 	   model->param.svm_type == EPSILON_SVR ||
 	   model->param.svm_type == NU_SVR)
 	{
-		double *sv_coef = model->sv_coef[0];
+		//double *sv_coef = model->sv_coef[0];
 		double sum = 0;
-		for(i=0;i<model->l;i++)
-			sum += sv_coef[i] * Kernel::k_function(x,model->SV[i],model->param);
-		sum -= model->rho[0];
-		*dec_values = sum;
+
+		//for(i=0;i<model->l;i++)
+		//	sum += sv_coef[i] * Kernel::k_function(model->SV[i],x,model->param, (i == 0));
+
+		//sum -= model->rho[0];
+
+		double sum_cuda = 0;
+		{
+			std::vector<int> x_cols;
+			typedef std::vector<double> X_Vals;
+			X_Vals x_vals;
+
+			x_cols.reserve(kernel.device_data->columns);
+			x_vals.reserve(kernel.device_data->columns);
+			const svm_node *xx = x;
+			while(xx->index != -1) {
+				x_cols.push_back(xx->index);
+				x_vals.push_back(X_Vals::value_type(xx->value));
+			}
+			sum_cuda = kernel.kernel_predict_rbf(model->param.gamma, (int)x_cols.size(), &x_cols[0], &x_vals[0], NULL) - model->rho[0];
+		}
+
+		sum = sum_cuda;
+		//std::cout << "sum=" << sum << " sum_cuda=" << sum_cuda << " difference: " << fabs(sum_cuda - sum) / (sum == 0 ? 1 : sum) << std::endl;
+
+		if (dec_values) {
+			*dec_values = sum;
+		}
 
 		if(model->param.svm_type == ONE_CLASS)
 			return (sum>0)?1:-1;
@@ -2500,8 +2821,39 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 		int l = model->l;
 		
 		double *kvalue = Malloc(double,l);
-		for(i=0;i<l;i++)
-			kvalue[i] = Kernel::k_function(x,model->SV[i],model->param);
+		////#pragma omp parallel for private(i)
+		//for(i=0;i<l;i++)
+		//	kvalue[i] = Kernel::k_function(model->SV[i],x,model->param, (i == 0));
+
+		{
+			std::vector<int> x_cols;
+			typedef std::vector<double> X_Vals;
+			X_Vals x_vals;
+			//std::vector<double> kvalue_cuda(kernel.device_data->rows);
+
+			x_cols.reserve(kernel.device_data->columns);
+			x_vals.reserve(kernel.device_data->columns);
+			const svm_node *xx = x;
+			while(xx->index != -1) {
+				x_cols.push_back(xx->index);
+				x_vals.push_back(X_Vals::value_type(xx->value));
+				++xx;
+			}
+			//kernel.kernel_predict_rbf(model->param.gamma, (int)x_cols.size(), &x_cols[0], &x_vals[0], &kvalue_cuda[0]);
+			kernel.kernel_predict_rbf(model->param.gamma, (int)x_cols.size(), &x_cols[0], &x_vals[0], kvalue);
+
+			//double diff = 0;
+			//for(size_t i = 0; i < kvalue_cuda.size(); ++i) {
+			////	if (i == 0) {
+			////		std::cout << "kvalue[" << i << "]=" << kvalue[i] << "  kvalue_cuda[" << i << "]="  << kvalue_cuda[i] << std::endl;
+			////	}
+			//	diff += fabs(kvalue[i] - kvalue_cuda[i]);
+			//}
+			//if (diff > 1e-3) {
+			//	std::cout << "sum difference: " << diff << " avg sum difference: " << diff / kvalue_cuda.size() << std::endl;
+			//}
+		}
+
 
 		int *start = Malloc(int,nr_class);
 		start[0] = 0;
@@ -2509,8 +2861,9 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 			start[i] = start[i-1]+model->nSV[i-1];
 
 		int *vote = Malloc(int,nr_class);
-		for(i=0;i<nr_class;i++)
-			vote[i] = 0;
+		memset(vote, 0, sizeof(*vote) * nr_class);
+		//for(i=0;i<nr_class;i++)
+		//	vote[i] = 0;
 
 		int p=0;
 		for(i=0;i<nr_class;i++)
@@ -2525,14 +2878,21 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 				int k;
 				double *coef1 = model->sv_coef[j-1];
 				double *coef2 = model->sv_coef[i];
+
+				#pragma omp parallel for private(k) reduction(+:sum)
 				for(k=0;k<ci;k++)
 					sum += coef1[si+k] * kvalue[si+k];
+
+				#pragma omp parallel for private(k) reduction(+:sum)
 				for(k=0;k<cj;k++)
 					sum += coef2[sj+k] * kvalue[sj+k];
-				sum -= model->rho[p];
-				dec_values[p] = sum;
 
-				if(dec_values[p] > 0)
+				sum -= model->rho[p];
+				if (dec_values) {
+					dec_values[p] = sum;
+				}
+
+				if(sum > 0)
 					++vote[i];
 				else
 					++vote[j];
@@ -2551,23 +2911,23 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 	}
 }
 
-double svm_predict(const svm_model *model, const svm_node *x)
+double svm_predict(const svm_model *model, CUDAKernelPredict& kernel, const svm_node *x)
 {
-	int nr_class = model->nr_class;
-	double *dec_values;
-	if(model->param.svm_type == ONE_CLASS ||
-	   model->param.svm_type == EPSILON_SVR ||
-	   model->param.svm_type == NU_SVR)
-		dec_values = Malloc(double, 1);
-	else 
-		dec_values = Malloc(double, nr_class*(nr_class-1)/2);
-	double pred_result = svm_predict_values(model, x, dec_values);
-	free(dec_values);
+	//int nr_class = model->nr_class;
+	//double *dec_values;
+	//if(model->param.svm_type == ONE_CLASS ||
+	//   model->param.svm_type == EPSILON_SVR ||
+	//   model->param.svm_type == NU_SVR)
+	//	dec_values = Malloc(double, 1);
+	//else 
+	//	dec_values = Malloc(double, nr_class*(nr_class-1)/2);
+	double pred_result = svm_predict_values(model, kernel, x, NULL);
+	//free(dec_values);
 	return pred_result;
 }
 
 double svm_predict_probability(
-	const svm_model *model, const svm_node *x, double *prob_estimates)
+	const svm_model *model, CUDAKernelPredict& kernel, const svm_node *x, double *prob_estimates)
 {
 	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC) &&
 	    model->probA!=NULL && model->probB!=NULL)
@@ -2575,7 +2935,7 @@ double svm_predict_probability(
 		int i;
 		int nr_class = model->nr_class;
 		double *dec_values = Malloc(double, nr_class*(nr_class-1)/2);
-		svm_predict_values(model, x, dec_values);
+		svm_predict_values(model, kernel, x, dec_values);
 
 		double min_prob=1e-7;
 		double **pairwise_prob=Malloc(double *,nr_class);
@@ -2602,7 +2962,7 @@ double svm_predict_probability(
 		return model->label[prob_max_idx];
 	}
 	else 
-		return svm_predict(model, x);
+		return svm_predict(model, kernel, x);
 }
 
 static const char *svm_type_table[] =
@@ -2740,7 +3100,7 @@ svm_model *svm_load_model(const char *model_file_name)
 
 	// read parameters
 
-	svm_model *model = Malloc(svm_model,1);
+	svm_model *model = new svm_model;
 	svm_parameter& param = model->param;
 	model->rho = NULL;
 	model->probA = NULL;
@@ -2942,6 +3302,11 @@ svm_model *svm_load_model(const char *model_file_name)
 		return NULL;
 
 	model->free_sv = 1;	// XXX
+
+	KernelBase kernel(model->l, model->SV, model->param);
+
+	model->cuda_kernel_data = kernel.cukerneldata;
+
 	return model;
 }
 
@@ -2949,6 +3314,7 @@ void svm_free_model_content(svm_model* model_ptr)
 {
 	if(model_ptr->free_sv && model_ptr->l > 0 && model_ptr->SV != NULL)
 		free((void *)(model_ptr->SV[0]));
+
 	if(model_ptr->sv_coef)
 	{
 		for(int i=0;i<model_ptr->nr_class-1;i++)
@@ -2985,7 +3351,7 @@ void svm_free_and_destroy_model(svm_model** model_ptr_ptr)
 	if(model_ptr_ptr != NULL && *model_ptr_ptr != NULL)
 	{
 		svm_free_model_content(*model_ptr_ptr);
-		free(*model_ptr_ptr);
+		delete (*model_ptr_ptr);
 		*model_ptr_ptr = NULL;
 	}
 }

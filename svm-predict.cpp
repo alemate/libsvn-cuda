@@ -3,14 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+
+#include <omp.h>
+
 #include "svm.h"
+
+#include <deque>
+
 
 int print_null(const char *s,...) {return 0;}
 
 static int (*info)(const char *fmt,...) = &printf;
-
-struct svm_node *x;
-int max_nr_attr = 64;
 
 struct svm_model* model;
 int predict_probability=0;
@@ -42,6 +45,23 @@ void exit_input_error(int line_num)
 	exit(1);
 }
 
+struct PredictionEntry {
+		double target_label;
+		double predict_label;
+		std::vector<svm_node> x;
+		std::vector<double> prob_estimates;
+
+
+		int inst_max_index;//  = -1; // strtol gives 0 if wrong format, and precomputed kernel has <index> start from 0
+
+		PredictionEntry()
+			: target_label(0)
+			, predict_label(0)
+			, inst_max_index(-1)
+		{
+		}
+};
+
 void predict(FILE *input, FILE *output)
 {
 	int correct = 0;
@@ -51,7 +71,6 @@ void predict(FILE *input, FILE *output)
 
 	int svm_type=svm_get_svm_type(model);
 	int nr_class=svm_get_nr_class(model);
-	double *prob_estimates=NULL;
 	int j;
 
 	if(predict_probability)
@@ -62,8 +81,7 @@ void predict(FILE *input, FILE *output)
 		{
 			int *labels=(int *) malloc(nr_class*sizeof(int));
 			svm_get_labels(model,labels);
-			prob_estimates = (double *) malloc(nr_class*sizeof(double));
-			fprintf(output,"labels");		
+			fprintf(output,"labels");
 			for(j=0;j<nr_class;j++)
 				fprintf(output," %d",labels[j]);
 			fprintf(output,"\n");
@@ -71,12 +89,25 @@ void predict(FILE *input, FILE *output)
 		}
 	}
 
+	const int numparallel = 4;
+
+	std::vector<std::unique_ptr<CUDAKernelPredict> > cuda_kernels;
+	for(int i = 0; i < numparallel; ++i) {
+		cuda_kernels.push_back(
+			std::unique_ptr<CUDAKernelPredict>(
+				new CUDAKernelPredict(model->cuda_kernel_data.get(), model->sv_coef[0], SVM_Type(model->param.svm_type))
+			)
+		);
+	}
+
+	std::deque<PredictionEntry> predictions;
+	const svm_node endnode = { -1, 0 }; // index = -1
+
 	max_line_len = 1024;
 	line = (char *)malloc(max_line_len*sizeof(char));
 	while(readline(input) != NULL)
 	{
 		int i = 0;
-		double target_label, predict_label;
 		char *idx, *val, *label, *endptr;
 		int inst_max_index = -1; // strtol gives 0 if wrong format, and precomputed kernel has <index> start from 0
 
@@ -84,61 +115,110 @@ void predict(FILE *input, FILE *output)
 		if(label == NULL) // empty line
 			exit_input_error(total+1);
 
-		target_label = strtod(label,&endptr);
+		predictions.resize(predictions.size() + 1);
+		PredictionEntry& theentry = predictions.back();
+		if (predict_probability) {
+			theentry.prob_estimates.resize(nr_class);
+		}
+
+
+		theentry.target_label = strtod(label,&endptr);
 		if(endptr == label || *endptr != '\0')
 			exit_input_error(total+1);
 
 		while(1)
 		{
-			if(i>=max_nr_attr-1)	// need one more for index = -1
-			{
-				max_nr_attr *= 2;
-				x = (struct svm_node *) realloc(x,max_nr_attr*sizeof(struct svm_node));
-			}
-
 			idx = strtok(NULL,":");
 			val = strtok(NULL," \t");
 
 			if(val == NULL)
 				break;
 			errno = 0;
-			x[i].index = (int) strtol(idx,&endptr,10);
-			if(endptr == idx || errno != 0 || *endptr != '\0' || x[i].index <= inst_max_index)
+			svm_node node;
+			node.index = (int) strtol(idx,&endptr,10);
+
+			if(endptr == idx || errno != 0 || *endptr != '\0' || node.index <= inst_max_index)
 				exit_input_error(total+1);
 			else
-				inst_max_index = x[i].index;
+				inst_max_index = node.index;
 
 			errno = 0;
-			x[i].value = strtod(val,&endptr);
+			node.value = strtod(val,&endptr);
 			if(endptr == val || errno != 0 || (*endptr != '\0' && !isspace(*endptr)))
 				exit_input_error(total+1);
 
-			++i;
+			theentry.x.push_back(node);
+
 		}
-		x[i].index = -1;
+
+		theentry.x.push_back(endnode);
+	}
+
+	unsigned reported = 0;
+
+	omp_set_num_threads(numparallel);
+
+	#pragma omp parallel for
+	for (int i = 0; i < predictions.size(); ++i) {
+		PredictionEntry& theentry = predictions[i];
+
+		const int threadnum = omp_get_thread_num() % cuda_kernels.size();
+
+		std::lock_guard<std::mutex> g(cuda_kernels[threadnum]->m);
 
 		if (predict_probability && (svm_type==C_SVC || svm_type==NU_SVC))
 		{
-			predict_label = svm_predict_probability(model,x,prob_estimates);
-			fprintf(output,"%g",predict_label);
+			theentry.predict_label = svm_predict_probability(model, *cuda_kernels[threadnum], &theentry.x[0], &theentry.prob_estimates[0]);
+		}
+		else
+		{
+			theentry.predict_label = svm_predict(model, *cuda_kernels[threadnum], &theentry.x[0]);
+		}
+		if (threadnum == 0 && unsigned(i / (double) predictions.size() * 100 * omp_get_max_threads()) > reported )  {
+			reported = unsigned(i / (double) predictions.size() * 100 * omp_get_max_threads());
+			std::cout << reported << "% done.\n";
+		}
+	}
+	size_t true_positive = 0;
+	size_t true_negative = 0;
+	size_t false_positive = 0;
+	size_t false_negative = 0;
+
+	for (size_t i = 0; i < predictions.size(); ++i) {
+		PredictionEntry& theentry = predictions[i];
+		if (predict_probability && (svm_type==C_SVC || svm_type==NU_SVC))
+		{
+			fprintf(output,"%g", theentry.predict_label);
 			for(j=0;j<nr_class;j++)
-				fprintf(output," %g",prob_estimates[j]);
+				fprintf(output," %g", theentry.prob_estimates[j]);
 			fprintf(output,"\n");
 		}
 		else
 		{
-			predict_label = svm_predict(model,x);
-			fprintf(output,"%g\n",predict_label);
+			fprintf(output,"%g\n", theentry.predict_label);
 		}
 
-		if(predict_label == target_label)
+		if(theentry.predict_label == theentry.target_label) {
 			++correct;
-		error += (predict_label-target_label)*(predict_label-target_label);
-		sump += predict_label;
-		sumt += target_label;
-		sumpp += predict_label*predict_label;
-		sumtt += target_label*target_label;
-		sumpt += predict_label*target_label;
+			if (theentry.predict_label > 0) {
+				++true_positive;
+			} else {
+				++true_negative;
+			}
+		} else {
+			if (theentry.predict_label > 0) {
+				++false_positive;
+			} else {
+				++false_negative;
+			}
+		}
+
+		error += (theentry.predict_label - theentry.target_label)*(theentry.predict_label - theentry.target_label);
+		sump += theentry.predict_label;
+		sumt += theentry.target_label;
+		sumpp += theentry.predict_label * theentry.predict_label;
+		sumtt += theentry.target_label * theentry.target_label;
+		sumpt += theentry.predict_label * theentry.target_label;
 		++total;
 	}
 	if (svm_type==NU_SVR || svm_type==EPSILON_SVR)
@@ -152,8 +232,14 @@ void predict(FILE *input, FILE *output)
 	else
 		info("Accuracy = %g%% (%d/%d) (classification)\n",
 			(double)correct/total*100,correct,total);
-	if(predict_probability)
-		free(prob_estimates);
+
+	info("total=%lu true_positive=%lu true_negative=%lu false_positive=%lu false_negative=%lu\n"
+			, predictions.size()
+			, true_positive
+			, true_negative
+			, false_positive
+			, false_negative
+	);
 }
 
 void exit_with_help()
@@ -214,7 +300,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	x = (struct svm_node *) malloc(max_nr_attr*sizeof(struct svm_node));
+	//x = (struct svm_node *) malloc(max_nr_attr*sizeof(struct svm_node));
 	if(predict_probability)
 	{
 		if(svm_check_probability_model(model)==0)
@@ -231,9 +317,11 @@ int main(int argc, char **argv)
 
 	predict(input,output);
 	svm_free_and_destroy_model(&model);
-	free(x);
+	//free(x);
 	free(line);
 	fclose(input);
 	fclose(output);
+
+	cudaDeviceReset();
 	return 0;
 }
